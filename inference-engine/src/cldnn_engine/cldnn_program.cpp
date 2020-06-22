@@ -3518,10 +3518,25 @@ void Program::AddConstantBlobInput(cldnn::topology& topology, InferenceEngine::C
         return false;
     };
 
+    auto input1DWA = [&constDims](InferenceEngine::CNNLayerPtr& layer) -> bool {
+        if (constDims.size() != 1)
+            return false;
+
+        bool need_batch_interpretation = false;
+
+        for (auto& next : GetNextLayers(layer->outData[0])) {
+            need_batch_interpretation |= LayerTypeFromStr(next->type) == Gather;
+            need_batch_interpretation |= LayerTypeFromStr(next->type) == Concatenate &&
+                                         as<InferenceEngine::ConcatLayer*>(layer)->_axis == 0;
+        }
+
+        return need_batch_interpretation;
+    };
+
     // If quantize on weights has per-channel ranges, we have to swap channel and batch dimensions, because
     // quantization should be applied per output channel of weights
     // TODO: Check if it's still needed once LowPrecisionTransformations ready
-    if (inputToConstQuantize(layer)) {
+    if (inputToConstQuantize(layer) || input1DWA(layer)) {
         constTensor.batch[0] = constTensor.count();
         constTensor.feature[0] = 1;
     }
