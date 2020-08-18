@@ -23,11 +23,35 @@
 #include "program_impl.h"
 #include "program_helpers.h"
 #include "mvn_inst.h"
+#include "reshape_inst.h"
 #include <vector>
 #include <memory>
 #include <list>
 #include <map>
 #include <set>
+
+#define CLDNN_REORDER_INPUTS_VERBOSE 0
+
+// Prints overall statistics of performed selection, such as number of reorders required
+#define CLDNN_REORDER_INPUTS_VERBOSE_STATISTICS          (CLDNN_REORDER_INPUTS_VERBOSE > 0)
+// Prints special cases and work-arounds matched
+#define CLDNN_REORDER_INPUTS_VERBOSE_PATTERN_MATCH       (CLDNN_REORDER_INPUTS_VERBOSE > 1)
+// Prints full list of preferred formats for each node
+#define CLDNN_REORDER_INPUTS_VERBOSE_PREFERRED           (CLDNN_REORDER_INPUTS_VERBOSE > 2)
+// Prints full list of selected formats for each node
+#define CLDNN_REORDER_INPUTS_VERBOSE_FORMATS             (CLDNN_REORDER_INPUTS_VERBOSE > 2)
+
+#if CLDNN_REORDER_INPUTS_VERBOSE
+#include "to_string_utils.h"
+#include <iostream>
+#define CLDNN_REORDER_INPUTS_LOG(x) std::cout << "[clDNN][reorder_inputs] " << x << std::endl
+#endif
+
+#if CLDNN_REORDER_INPUTS_VERBOSE_PATTERN_MATCH
+#define CLDNN_REORDER_INPUTS_PATTERN_MATCH_LOG(desc, id) CLDNN_REORDER_INPUTS_LOG(id << " matched for pattern: " << desc)
+#else
+#define CLDNN_REORDER_INPUTS_PATTERN_MATCH_LOG(desc, id) do { } while (false)
+#endif
 
 using namespace cldnn;
 
@@ -92,7 +116,8 @@ bool can_propagate_formats_rec(
     layout_optimizer& lo,
     program_node* prev,
     program_node* node,
-    format::type fmt) {
+    format::type fmt,
+    bool allow_fusing) {
 
     auto sel_fmt = fmt_map.at(node);
     if (fmt == sel_fmt)
@@ -103,10 +128,10 @@ bool can_propagate_formats_rec(
     auto first_fmt = travel_direction_wrapper<dir>::first(fmt, sel_fmt);
     auto second_fmt = travel_direction_wrapper<dir>::second(fmt, sel_fmt);
 
-    if (lo.can_fuse_reorder(*first_node,
-                            *second_node,
-                            first_fmt,
-                            second_fmt))
+    if (allow_fusing && lo.can_fuse_reorder(*first_node,
+                                            *second_node,
+                                            first_fmt,
+                                            second_fmt))
         return true;
 
     if (sel_fmt != format::any)
@@ -128,7 +153,7 @@ bool can_propagate_formats_rec(
     for (auto next : travel_direction_wrapper<dir>::next_nodes(node)) {
         if (!next->is_in_data_flow())
             continue;
-        if (!can_propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt))
+        if (!can_propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt, allow_fusing))
             return false;
     }
 
@@ -140,7 +165,8 @@ void propagate_formats_rec(std::map<program_node*, format::type>& fmt_map,
                            layout_optimizer& lo,
                            program_node* prev,
                            program_node* node,
-                           format::type fmt) {
+                           format::type fmt,
+                           bool allow_fusing) {
     auto sel_fmt = fmt_map.at(node);
     if (sel_fmt == fmt)
         return;
@@ -150,10 +176,10 @@ void propagate_formats_rec(std::map<program_node*, format::type>& fmt_map,
     auto first_fmt = travel_direction_wrapper<dir>::first(fmt, sel_fmt);
     auto second_fmt = travel_direction_wrapper<dir>::second(fmt, sel_fmt);
 
-    if (lo.can_fuse_reorder(*first_node,
-                            *second_node,
-                            first_fmt,
-                            second_fmt))
+    if (allow_fusing && lo.can_fuse_reorder(*first_node,
+                                            *second_node,
+                                            first_fmt,
+                                            second_fmt))
         return;
 
     fmt_map.at(node) = fmt;
@@ -161,31 +187,32 @@ void propagate_formats_rec(std::map<program_node*, format::type>& fmt_map,
     for (auto next : travel_direction_wrapper<dir>::next_nodes(node)) {
         if (!next->is_in_data_flow())
             continue;
-        propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt);
+        propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt, allow_fusing);
     }
 }
 
 template <direction_e dir>
 void propagate_formats_in_dir(std::map<program_node*, format::type>& fmt_map,
-                         layout_optimizer& lo,
-                         program_node* node) {
+                              layout_optimizer& lo,
+                              program_node* node,
+                              bool allow_fusing) {
     auto fmt = fmt_map.at(node);
 
     for (auto next : travel_direction_wrapper<dir>::next_nodes(node)) {
         if (!next->is_in_data_flow())
             continue;
-        if (!can_propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt))
+        if (!can_propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt, allow_fusing))
             return;
     }
 
     for (auto next : travel_direction_wrapper<dir>::next_nodes(node)) {
         if (!next->is_in_data_flow())
             continue;
-        propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt);
+        propagate_formats_rec<dir>(fmt_map, lo, node, next, fmt, allow_fusing);
     }
 }
 
-void propagate_formats(program_impl& p, std::map<program_node*, format::type>& fmt_map, layout_optimizer& lo) {
+void propagate_formats(program_impl& p, std::map<program_node*, format::type>& fmt_map, layout_optimizer& lo, bool allow_fusing) {
     auto it = p.get_processing_order().begin();
     while (it != p.get_processing_order().end()) {
         auto node = *it++;
@@ -193,8 +220,136 @@ void propagate_formats(program_impl& p, std::map<program_node*, format::type>& f
         if (fmt_map.count(node) == 0 || fmt_map.at(node) == format::any)
             continue;
 
-        propagate_formats_in_dir<direction_e::forwards>(fmt_map, lo, node);
-        propagate_formats_in_dir<direction_e::backwards>(fmt_map, lo, node);
+        propagate_formats_in_dir<direction_e::forwards>(fmt_map, lo, node, allow_fusing);
+        propagate_formats_in_dir<direction_e::backwards>(fmt_map, lo, node, allow_fusing);
+    }
+}
+
+bool analyse_propagation_extent(const std::map<program_node*, format::type>& fmt_map,
+                                layout_optimizer& lo,
+                                program_node* root,
+                                format::type fmt,
+                                bool allow_fusing,
+                                std::set<program_node*>& extent) {
+    struct candidate_info {
+        program_node* prev;
+        program_node* next;
+        direction_e dir;
+    };
+
+    extent.insert(root);
+    std::list<program_node*> candidate_roots;
+    std::list<candidate_info> candidates;
+    for (auto next : travel_direction_wrapper<direction_e::backwards>::next_nodes(root)) {
+        if (next->is_in_data_flow())
+            candidates.push_back({ root, next, direction_e::backwards });
+    }
+    for (auto next : travel_direction_wrapper<direction_e::forwards>::next_nodes(root)) {
+        if (next->is_in_data_flow())
+            candidates.push_back({ root, next, direction_e::forwards });
+    }
+
+    while (!candidates.empty()) {
+        candidate_info info = candidates.front();
+        candidates.pop_front();
+        program_node* prev = info.prev;
+        program_node* node = info.next;
+        direction_e dir = info.dir;
+
+        if (extent.count(node) != 0)
+            continue;
+
+        auto sel_fmt = fmt_map.at(node);
+        if (fmt == sel_fmt)
+            continue;
+
+        auto first_node = dir == direction_e::forwards ? prev : node;
+        auto second_node = dir == direction_e::forwards ? node : prev;
+        auto first_fmt = dir == direction_e::forwards ? fmt : sel_fmt;
+        auto second_fmt = dir == direction_e::forwards ? sel_fmt : fmt;
+
+        bool is_format_supported = lo.is_format_supported(*node, fmt);
+
+        if (allow_fusing && lo.can_fuse_reorder(*first_node,
+                                                *second_node,
+                                                first_fmt,
+                                                second_fmt)) {
+            if (is_format_supported)
+                candidate_roots.push_back(node);
+            continue;
+        }
+
+        if (sel_fmt != format::any)
+            return false;
+
+        // Fusing with fallback format
+        auto fb_fmt = node->get_output_layout().format;
+        auto first_fb_fmt = dir == direction_e::forwards ? fmt : fb_fmt;
+        auto second_fb_fmt = dir == direction_e::forwards ? fb_fmt : fmt;
+
+        if (allow_fusing && lo.can_fuse_reorder(*first_node,
+                                                *second_node,
+                                                first_fb_fmt,
+                                                second_fb_fmt)) {
+            if (is_format_supported)
+                candidate_roots.push_back(node);
+            continue;
+        }
+
+        if (!is_format_supported)
+            return false;
+
+        for (auto next : travel_direction_wrapper<direction_e::backwards>::next_nodes(node)) {
+            if (next->is_in_data_flow() && extent.count(next) == 0)
+                candidates.push_back({ node, next, direction_e::backwards });
+        }
+        for (auto next : travel_direction_wrapper<direction_e::forwards>::next_nodes(node)) {
+            if (next->is_in_data_flow() && extent.count(next) == 0)
+                candidates.push_back({ node, next, direction_e::forwards });
+        }
+        extent.insert(node);
+    }
+
+    program_node* rejected_checkpoint = nullptr;
+    while (!candidate_roots.empty()) {
+        auto next_root = candidate_roots.front();
+        candidate_roots.pop_front();
+        if (extent.count(next_root) != 0)
+            continue;
+
+        auto copy_extent = extent;
+        bool success = analyse_propagation_extent(fmt_map, lo, next_root, fmt, allow_fusing, extent);
+        if (success) {
+            rejected_checkpoint = nullptr;
+            continue;
+        }
+
+        extent = copy_extent;
+        if (rejected_checkpoint == next_root)
+            break;
+        if (rejected_checkpoint == nullptr)
+            rejected_checkpoint = next_root;
+        candidate_roots.push_back(next_root);
+    }
+    return true;
+}
+
+void propagate_formats_v2(program_impl& p, std::map<program_node*, format::type>& fmt_map, layout_optimizer& lo, bool allow_fusing) {
+    std::set<program_node*> extent;
+    auto it = p.get_processing_order().begin();
+    while (it != p.get_processing_order().end()) {
+        auto node = *it++;
+
+        if (fmt_map.count(node) == 0 || fmt_map.at(node) == format::any)
+            continue;
+
+        extent.clear();
+        bool success = analyse_propagation_extent(fmt_map, lo, node, fmt_map.at(node), allow_fusing, extent);
+        if (!success)
+            continue;
+        for (auto e : extent) {
+            fmt_map.at(e) = fmt_map.at(node);
+        }
     }
 }
 
@@ -370,7 +525,49 @@ void insert_reorders(program_impl& p, const std::map<program_node*, format::type
 
 void reorder_inputs::run(program_impl& p, layout_optimizer& lo, reorder_factory& rf) {
     auto fmt_map = get_preferred_formats(p, lo);
-    propagate_formats(p, fmt_map, lo);
+#if CLDNN_REORDER_INPUTS_VERBOSE_PREFERRED
+    {
+        CLDNN_REORDER_INPUTS_LOG("Preferred formats:");
+        for (auto& node_fmt : fmt_map) {
+            if (node_fmt.second != format::any) {
+                CLDNN_REORDER_INPUTS_LOG("  " << node_fmt.first->id() << " " << fmt_to_str(node_fmt.second));
+            }
+        }
+    }
+#endif
+
+    // Override fully connected at boundary between X -> yxfb
+    // to use specialized implementation X -> bfyx instead.
+    for (auto& node_ptr : p.get_processing_order()) {
+        if (!node_ptr->is_in_data_flow() || !node_ptr->is_type<fully_connected>())
+            continue;
+        if (fmt_map.count(node_ptr) == 0 || fmt_map.at(node_ptr) == format::bfyx)
+            continue;
+
+        // Check if backwards path leads to one of formats using fully_connected with bfyx output
+        // and special implementation can be used.
+        auto input_ptr = &node_ptr->get_dependency(0);
+        bool override_to_bfyx = false;
+        auto should_override_for_format = [&](format::type fmt) {
+            return lo.can_fuse_reorder(*input_ptr, *node_ptr, fmt, format::bfyx) &&
+                can_propagate_formats_rec<direction_e::backwards>(fmt_map, lo, node_ptr, input_ptr, fmt, false);
+        };
+        override_to_bfyx |= should_override_for_format(format::fs_b_yx_fsv32);
+        override_to_bfyx |= should_override_for_format(format::b_fs_yx_fsv4);
+        override_to_bfyx |= should_override_for_format(format::b_fs_yx_fsv16);
+        override_to_bfyx |= should_override_for_format(format::b_fs_yx_fsv32);
+        override_to_bfyx |= should_override_for_format(format::b_fs_zyx_fsv32);
+        override_to_bfyx |= should_override_for_format(format::byxf_af32);
+
+        if (!override_to_bfyx)
+            continue;
+
+        fmt_map[node_ptr] = format::bfyx;
+
+        CLDNN_REORDER_INPUTS_PATTERN_MATCH_LOG("override fc output to bfyx", node_ptr->id());
+    }
+    //propagate_formats(p, fmt_map, lo, true);
+    propagate_formats_v2(p, fmt_map, lo, true);
     minimize_local_reorders(p, fmt_map, lo);
 
     // WA START ============================================================================================================
@@ -432,9 +629,57 @@ void reorder_inputs::run(program_impl& p, layout_optimizer& lo, reorder_factory&
 
             fmt_map.at(node_ptr) = format::b_fs_yx_fsv16;
             fmt_map.at(conv_node.get_users().front()) = format::b_fs_yx_fsv16;
+
+            CLDNN_REORDER_INPUTS_PATTERN_MATCH_LOG("change int8 mvn->conv->mvn to b_fs_yx_fsv16", node_ptr->id());
         }
     }
     // WA END ==============================================================================================================
+
+#if CLDNN_REORDER_INPUTS_VERBOSE_FORMATS
+    {
+        CLDNN_REORDER_INPUTS_LOG("Selected formats:");
+        for (auto node_ptr : p.get_processing_order()) {
+            if (fmt_map.count(node_ptr) == 0)
+                continue;
+
+            auto fmt = fmt_map.at(node_ptr);
+            CLDNN_REORDER_INPUTS_LOG("  " << node_ptr->id() << " " << fmt_to_str(fmt));
+        }
+    }
+#endif
+#if CLDNN_REORDER_INPUTS_VERBOSE_STATISTICS
+    {
+        reorder_cnt total_reorder_count = std::accumulate(
+            p.get_processing_order().begin(),
+            p.get_processing_order().end(),
+            reorder_cnt{ 0, 0 },
+            [&](reorder_cnt& total, program_node* node) {
+            if (fmt_map.count(node) == 0 || fmt_map.at(node) == format::any)
+                return total;
+            auto count = count_reorders(fmt_map, lo, node);
+            return reorder_cnt{ total.number + count.number, total.total_sizes + count.total_sizes };
+        });
+        // Divide results by two as above function will each reorder from both sides
+        CLDNN_REORDER_INPUTS_LOG("Total number of reorders: " << total_reorder_count.number / 2);
+        CLDNN_REORDER_INPUTS_LOG("Total elements count of all reorders: " << total_reorder_count.total_sizes / 2);
+
+        // Count number of reorders that will be fused
+        size_t nodes_with_fusing = 0;
+        for (auto node_ptr : p.get_processing_order()) {
+            if (fmt_map.count(node_ptr) == 0 || fmt_map.at(node_ptr) == format::any)
+                continue;
+            for (auto prev_ptr : travel_direction_wrapper<direction_e::backwards>::next_nodes(node_ptr)) {
+                if (!prev_ptr->is_in_data_flow() || fmt_map.at(prev_ptr) == fmt_map.at(node_ptr))
+                    continue;
+                if (lo.can_fuse_reorder(*prev_ptr, *node_ptr, fmt_map.at(prev_ptr), fmt_map.at(node_ptr))) {
+                    nodes_with_fusing += 1;
+                    break;
+                }
+            }
+        }
+        CLDNN_REORDER_INPUTS_LOG("Number of nodes with fused reorders: " << nodes_with_fusing);
+    }
+#endif
 
     insert_reorders(p, fmt_map, rf);
 

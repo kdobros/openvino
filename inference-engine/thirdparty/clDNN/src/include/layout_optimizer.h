@@ -137,6 +137,9 @@ private:
     layout get_expected_layout(layout const& current_layout,
                                binary_convolution_node const& node,
                                layout const& output_or_weights_layout);
+    layout get_expected_layout(layout const& current_layout,
+                               fully_connected_node const& node,
+                               layout const& output_or_weights_layout);
 
     bool is_depthwise(const convolution_node& node) const;
     format imad_case(convolution_node const& node) const;

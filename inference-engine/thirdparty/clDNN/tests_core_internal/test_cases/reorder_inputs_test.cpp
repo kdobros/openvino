@@ -81,6 +81,59 @@ TEST(reorder_inputs, propagation) {
     EXPECT_EQ(pool_node.get_output_layout().format.value, conv_pref);
 }
 
+TEST(reorder_inputs, propagation_branches) {
+    // Topology:
+    // fully_connected -> activation -> eltwise -> activation -> eltwise -> fully_connected
+    //                 \  activation  <           \           /
+    //                                 activation - eltwise /
+    //
+    // Both fully_connected have same parameters.
+    //
+    // Expectation:
+    // Both fully_connected should execute in the same, preferred format.
+    // Format of fully_connected should be propagated through other layers.
+    // At most single reorder should be inserted before first fully_connected.
+
+    auto engine = get_test_engine();
+    auto input = memory::allocate(engine, { data_types::f16, format::yxfb, { 2, 32, 1, 1 } });
+    auto weights = memory::allocate(engine, { data_types::f16, format::bfyx, { 32, 32, 1, 1 } });
+
+    topology topology;
+    topology.add(data("weights", weights));
+    topology.add(input_layout("input", input.get_layout()));
+    topology.add(fully_connected("fc1", "input", "weights"));
+    topology.add(activation("actv1", "fc1", activation_func::relu));
+    topology.add(activation("actv2", "fc1", activation_func::relu));
+    topology.add(eltwise("eltw1", { "actv1", "actv2" }, eltwise_mode::sum));
+    topology.add(activation("actv3", "actv2", activation_func::negative));
+    topology.add(eltwise("eltw2", { "eltw1", "actv3" }, eltwise_mode::sum));
+    topology.add(activation("actv4", "eltw1", activation_func::relu));
+    topology.add(eltwise("eltw3", { "actv4", "eltw2" }, eltwise_mode::sum));
+    topology.add(fully_connected("fc2", "eltw3", "weights"));
+
+    build_options build_opts;
+    build_opts.set_option(build_option::optimize_data(true));
+    auto prog = program(engine, topology, build_opts);
+
+    auto prog_impl = prog.get();
+
+    size_t reorder_cnt = 0;
+    for (auto node : prog_impl->get_processing_order()) {
+        if (node->is_type<reorder>())
+            reorder_cnt += 1;
+    }
+    EXPECT_LE(reorder_cnt, 1u);
+
+    auto& fc1_node = prog_impl->get_node("fc1");
+    auto& fc2_node = prog_impl->get_node("fc2");
+
+    layout_optimizer lo;
+    auto pref_fmt = lo.get_preferred_format(fc1_node);
+
+    EXPECT_EQ(fc1_node.get_output_layout().format.value, pref_fmt);
+    EXPECT_EQ(fc2_node.get_output_layout().format.value, pref_fmt);
+}
+
 TEST(reorder_inputs, impl_forcing_basic_format) {
     auto engine = get_test_engine();
     auto input = memory::allocate(engine, { data_types::f32, format::bfyx, { 1, 2, 4, 1 } });

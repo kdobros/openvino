@@ -64,25 +64,26 @@ layout fully_connected_inst::calc_output_layout(fully_connected_node const& node
     if (node.has_fused_primitives()) {
         output_type = node.get_fused_output_layout().data_type;
     }
+    return layout(output_type, input_layout.format, tensor(input_layout.size.batch[0], weights_layout.size.batch[0], 1, 1));
 
-    if (data_type_traits::is_floating_point(input_layout.data_type) &&
-        (is_batch_after_spatial(input_layout.format.order()) ||
-        (input_layout.format ==
-             format::bfyx &&  // this condition tests whether our input is batch>1 in bfyx format, if yes there will be
-         input_layout.size.batch[0] > 1) ||  // extra reorder between input and this fc from bfyx to yxfb format (so
-                                             // "is_batch_after_spatial" should return true)
-        input_layout.format == format::bs_x_bsv16 ||
-        input_layout.format == format::bs_xs_xsv8_bsv8)) {
-        auto result = layout(output_type,
-                             format::yxfb,
-                             tensor(input_layout.size.batch[0], weights_layout.size.batch[0], 1, 1));
-        return result;
-    } else {
-        auto result = layout(output_type,
-                             format::bfyx,
-                             tensor(input_layout.size.batch[0], weights_layout.size.batch[0], 1, 1));
-        return result;
-    }
+    //if (data_type_traits::is_floating_point(input_layout.data_type) &&
+    //    (is_batch_after_spatial(input_layout.format.order()) ||
+    //    (input_layout.format ==
+    //         format::bfyx &&  // this condition tests whether our input is batch>1 in bfyx format, if yes there will be
+    //     input_layout.size.batch[0] > 1) ||  // extra reorder between input and this fc from bfyx to yxfb format (so
+    //                                         // "is_batch_after_spatial" should return true)
+    //    input_layout.format == format::bs_x_bsv16 ||
+    //    input_layout.format == format::bs_xs_xsv8_bsv8)) {
+    //    auto result = layout(output_type,
+    //                         format::yxfb,
+    //                         tensor(input_layout.size.batch[0], weights_layout.size.batch[0], 1, 1));
+    //    return result;
+    //} else {
+    //    auto result = layout(output_type,
+    //                         format::bfyx,
+    //                         tensor(input_layout.size.batch[0], weights_layout.size.batch[0], 1, 1));
+    //    return result;
+    //}
 }
 
 std::string fully_connected_inst::to_string(fully_connected_node const& node) {

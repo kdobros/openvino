@@ -419,6 +419,28 @@ void program_impl::pre_optimize_graph(bool is_internal) {
 
         apply_opt_pass<prepare_primitive_fusing>(lo);
 
+        {
+            auto node_itr = get_processing_order().begin();
+            while (node_itr != get_processing_order().end()) {
+                auto node_ptr = (*node_itr++);
+                if (!node_ptr->is_type<reshape>())
+                    continue;
+                auto& node = node_ptr->as<reshape>();
+                auto input_lay = node.input().get_output_layout();
+                auto output_lay = node.get_output_layout();
+
+                if (!node.is_in_place())
+                    return;
+
+                if (input_lay == output_lay) {
+                    add_optimized_primitive_info(node.id());
+                    extract_and_remove(node);
+                }
+            }
+
+            apply_opt_pass<remove_redundant_reorders>(lo, true);
+        }
+
         apply_opt_pass<reorder_inputs>(lo, rf);
         // Ideally this should be done before fusing to simplify logic and make the pass more powerful,
         // but after format selection to select correct alignment.

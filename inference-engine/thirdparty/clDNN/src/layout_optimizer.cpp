@@ -180,14 +180,19 @@ bool layout_optimizer::can_fuse_reorder(program_node& prev, program_node& next, 
         return true;
     }
 
-    if (next.is_type<fully_connected>() &&
-        (fmt_prev == format::bfyx || fmt_prev == format::yxfb ||
-         fmt_prev == format::b_fs_yx_fsv16 || fmt_prev == format::fs_b_yx_fsv32 ||
-         fmt_prev == format::byxf_af32 || fmt_prev == format::b_fs_yx_fsv32 ||
-         (fmt_prev == format::b_fs_yx_fsv4 &&
-          prev_output_layout.size.feature[0] % 32 == 0 &&
-          prev_output_layout.size.spatial[0] == 1 &&
-          prev_output_layout.size.spatial[1] == 1)))
+    if (next.is_type<fully_connected>() && is_input_idx(0) && fmt_next == format::bfyx && fmt_prev == format::fs_b_yx_fsv32)
+        return true;
+
+    if (next.is_type<fully_connected>() && is_input_idx(0) && (prev_dt == data_types::u8 || prev_dt == data_types::i8) &&
+        fmt_next == format::bfyx &&
+        (fmt_prev == format::b_fs_yx_fsv16 || fmt_prev == format::b_fs_yx_fsv4) &&
+        prev_output_layout.size.feature[0] % 32 == 0 &&
+        prev_output_layout.size.spatial[0] == 1 && prev_output_layout.size.spatial[1] == 1)
+        return true;
+
+    if (next.is_type<fully_connected>() && is_input_idx(0) && (prev_dt == data_types::u8 || prev_dt == data_types::i8) &&
+        fmt_next == format::bfyx &&
+        (fmt_prev == format::b_fs_yx_fsv32 || fmt_prev == format::b_fs_zyx_fsv16 || fmt_prev == format::byxf_af32))
         return true;
 
     if (next.is_type<convolution>() && fmt_prev == format::byxf_af32 && fmt_next == format::b_fs_yx_fsv4 && next.as<convolution>().get_groups() != 1)
@@ -799,6 +804,49 @@ layout layout_optimizer::get_expected_layout(layout const& current_layout,
     return layout(expected_data_type, expected_format, expected_tensor);
 }
 
+namespace {
+bool is_batch_after_spatial(const std::string order) {
+    bool spatial_found = false;
+    for (auto c : order) {
+        switch (c) {
+        case 'b':
+        case 'n':
+            return spatial_found;
+
+        case 'x':
+        case 'y':
+        case 'z':
+        case 'w':
+        case 's':
+            spatial_found = true;
+            break;
+
+        default:
+            break;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+layout layout_optimizer::get_expected_layout(layout const& current_layout,
+                                             fully_connected_node const& node,
+                                             layout const& /*output_or_weights_layout*/) {
+    auto expected_tensor = current_layout.size;
+    auto expected_data_type = current_layout.data_type;
+    auto expected_format = current_layout.format;
+    auto input_layout = node.input().get_output_layout();
+
+    if (data_type_traits::is_floating_point(input_layout.data_type) &&
+        (is_batch_after_spatial(input_layout.format.order()) || input_layout.size.batch[0] > 1)) {
+        expected_format = format::yxfb;
+    } else {
+        expected_format = format::bfyx;
+    }
+
+    return layout(expected_data_type, expected_format, expected_tensor);
+}
+
 format layout_optimizer::get_preferred_format(program_node& node) {
     format expected = format::any;
     auto output_layout = node.get_output_layout();
@@ -837,6 +885,10 @@ format layout_optimizer::get_preferred_format(program_node& node) {
         auto& deconv_node = node.as<deconvolution>();
         auto weights_layout = deconv_node.weights(0).get_output_layout();
         expected = get_expected_layout(output_layout, deconv_node, weights_layout).format;
+    } else if (node.is_type<fully_connected>()) {
+        auto& fc_node = node.as<fully_connected>();
+        auto weights_layout = fc_node.weights().get_output_layout();
+        expected = get_expected_layout(output_layout, fc_node, weights_layout).format;
     }
 
     return expected;

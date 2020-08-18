@@ -36,6 +36,8 @@ ParamsKey ReduceKernelRef::GetSupportedKey() const {
     k.EnableOutputLayout(DataLayout::bfzyx);
     k.EnableInputLayout(DataLayout::bfwzyx);
     k.EnableOutputLayout(DataLayout::bfwzyx);
+    k.EnableInputLayout(DataLayout::yxfb);
+    k.EnableOutputLayout(DataLayout::yxfb);
     k.EnableTensorOffset();
     k.EnableTensorPitches();
     k.EnableBatching();
@@ -106,7 +108,7 @@ JitConstants ReduceKernelRef::GetJitConstants(const reduce_params& params) const
                 case 3: return "SIZE_Y";
                 case 4: return "SIZE_X";
             }
-        } else if (params.inputs[0].GetLayout() == DataLayout::bfyx) {
+        } else if (params.inputs[0].GetLayout() == DataLayout::bfyx || params.inputs[0].GetLayout() == DataLayout::yxfb) {
             switch (dim) {
                 case 0: return "BATCH_NUM";
                 case 1: return "FEATURE_NUM";

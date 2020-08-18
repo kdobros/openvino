@@ -77,8 +77,8 @@ void remove_redundant_reorders::run(program_impl& p) {
                     break;
                 }
 
-                if (usr->is_type<fully_connected>())
-                    recalc_list.push_back(usr);
+                // if (usr->is_type<fully_connected>())
+                //     recalc_list.push_back(usr);
             }
 
             if (!all_users_fuse)
